@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>SafeLink ML Dashboard</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <link rel="stylesheet" href="style.css"/>
+</head>
+<body>
+
+  <header>
+    <div class="logo">Safe<span>Link</span> ML</div>
+    <nav class="tabs">
+      <button class="tab-btn active" data-tab="earthquake">&#127757; Earthquakes</button>
+      <button class="tab-btn" data-tab="flood">&#127754; Flood Risk</button>
+    </nav>
+    <div id="api-status">
+      <div class="status-dot" id="status-dot"></div>
+      <span id="status-text">Connecting…</span>
+    </div>
+  </header>
+
+  <!-- ===== EARTHQUAKE TAB ===== -->
+  <div id="tab-earthquake" class="tab-panel active">
+    <div class="sidebar">
+      <div class="sidebar-header">
+        <h2>Earthquake Monitor</h2>
+        <p>Global &middot; BiLSTM Aftershock Prediction &middot; USGS Live Data</p>
+      </div>
+      <div class="sidebar-controls">
+        <div class="coord-row">
+          <div class="coord-field">
+            <label>Latitude</label>
+            <input type="number" id="eq-lat" placeholder="e.g. 34.01" min="-90" max="90" step="0.0001"/>
+          </div>
+          <div class="coord-field">
+            <label>Longitude</label>
+            <input type="number" id="eq-lng" placeholder="e.g. 71.57" min="-180" max="180" step="0.0001"/>
+          </div>
+        </div>
+        <p class="hint">Click anywhere on the map to set the search origin. Searches a 200&thinsp;km radius for earthquakes in the last 24&thinsp;h.</p>
+        <div class="btn-row">
+          <button class="btn btn-primary" id="eq-search-btn" disabled>Search Earthquakes</button>
+          <button class="btn btn-secondary" id="eq-locate-btn">My Location</button>
+        </div>
+      </div>
+      <div class="sidebar-results" id="eq-results">
+        <div class="empty-state">
+          <div class="empty-icon">&#128506;</div>
+          Click on the map or enter coordinates to search for recent earthquakes.
+        </div>
+      </div>
+    </div>
+    <div id="eq-map"></div>
+  </div>
+
+  <!-- ===== FLOOD TAB ===== -->
+  <div id="tab-flood" class="tab-panel">
+    <div class="sidebar">
+      <div class="sidebar-header">
+        <h2>Flood Risk &mdash; Pakistan</h2>
+        <p>XGBoost Model &middot; Open-Meteo Rainfall &middot; 2014&ndash;Present</p>
+      </div>
+      <div class="sidebar-controls">
+        <div class="coord-row">
+          <div class="coord-field">
+            <label>Latitude</label>
+            <input type="number" id="flood-lat" value="30.3753" min="23.5" max="37.5" step="0.0001"/>
+          </div>
+          <div class="coord-field">
+            <label>Longitude</label>
+            <input type="number" id="flood-lng" value="69.3451" min="60.0" max="78.5" step="0.0001"/>
+          </div>
+        </div>
+        <div class="coord-field">
+          <label>Date</label>
+          <input type="date" id="flood-date" min="2014-01-01"/>
+        </div>
+        <p class="hint">Click inside Pakistan to check flood risk. Past dates use archive rainfall; future dates use forecasts (max 16&thinsp;days ahead).</p>
+        <div class="btn-row">
+          <button class="btn btn-primary" id="flood-check-btn">Check Risk</button>
+          <button class="btn btn-secondary btn-sm" id="heatmap-btn">Show Heatmap</button>
+          <button class="btn btn-secondary btn-sm" id="history-btn">History</button>
+        </div>
+      </div>
+      <div class="sidebar-results" id="flood-result">
+        <div class="empty-state">
+          <div class="empty-icon">&#127477;&#127472;</div>
+          Click on the map or press "Check Risk" to assess flood risk for the selected date.
+        </div>
+      </div>
+    </div>
+    <div class="map-container">
+      <div id="flood-map"></div>
+      <div class="history-overlay" id="history-overlay">
+        <div class="history-overlay-header">
+          <span>Historical Flood Events</span>
+          <button class="btn btn-secondary btn-sm" onclick="document.getElementById('history-overlay').classList.remove('open')">&#10005;</button>
+        </div>
+        <div id="history-list"></div>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
