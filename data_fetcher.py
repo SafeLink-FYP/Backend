@@ -118,9 +118,12 @@ class USGSFetcher:
                     "format": "geojson",
                     "starttime": starttime.strftime("%Y-%m-%dT%H:%M:%SZ"),
                     "endtime": endtime.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "latitude": latitude,
+                    "longitude": longitude,
+                    "maxradiuskm": radius_km,
                     "minmagnitude": min_magnitude,
                     "orderby": "time",
-                    "limit": 50,
+                    "limit": 100,
                 }
                 
                 response = await client.get(self.BASE_URL, params=params)
@@ -264,13 +267,13 @@ class RainfallFetcher:
                     "timestamp": datetime.utcnow().isoformat()
                 }
         
-        except Exception as e:
-            logger.error(f"❌ Error fetching rainfall data: {e}")
+        except Exception:
+            logger.exception("Error fetching rainfall data from Open-Meteo")
             return {
                 "rainfall_mm": 0.0,
                 "river_discharge": 0.0,
                 "data_source": "error",
-                "timestamp": datetime.utcnow().isoformat()
+                "timestamp": datetime.utcnow().isoformat(),
             }
 
 

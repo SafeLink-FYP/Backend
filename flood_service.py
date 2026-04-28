@@ -6,10 +6,12 @@ Provides flood risk assessment based on user location and historical weather dat
 
 import os
 import json
-import pickle
+import logging
 from pathlib import Path
 from typing import Optional, Dict, List
 from datetime import datetime, timedelta
+
+logger = logging.getLogger(__name__)
 
 
 class FloodRiskLevel:
@@ -58,39 +60,40 @@ class FloodModel:
             )
         
         self.model_dir = Path(model_dir)
-        self.model = None
-        self.scaler = None
         self.heatmap_data = {}
         self.is_loaded = False
-        
-        self._load_model()
-    
-    def _load_model(self):
-        """Load the trained model and heatmap data"""
+
+        self._load_heatmap()
+
+    def _load_heatmap(self):
+        """Load the most recent precomputed XGBoost heatmap payload.
+
+        The XGBoost model itself runs offline (see
+        `models/flood-api-data-fetcher/xgboost_geospatial_pipeline.py`) and bakes
+        its spatial predictions into `data/heatmap_payload_xgb_*.json`. Runtime
+        risk = heuristic on live rainfall/discharge blended with this heatmap.
+        """
         try:
-            # Try to load XGBoost model
-            model_path = self.model_dir / "xgboost_geospatial_pipeline.pkl"
-            if model_path.exists():
-                with open(model_path, "rb") as f:
-                    self.model = pickle.load(f)
-                self.is_loaded = True
-            
-            # Load latest heatmap data (precomputed)
             data_dir = self.model_dir / "data"
-            if data_dir.exists():
-                # Load the most recent heatmap
-                heatmap_files = sorted(
-                    data_dir.glob("heatmap_payload_xgb_*.json"),
-                    reverse=True
-                )
-                if heatmap_files:
-                    with open(heatmap_files[0], "r") as f:
-                        self.heatmap_data = json.load(f)
-            
-            print(f"✅ Flood model loaded from {self.model_dir}")
-            
-        except Exception as e:
-            print(f"⚠️  Flood model not fully available: {e}")
+            if not data_dir.exists():
+                logger.warning("Flood data dir missing: %s", data_dir)
+                return
+
+            heatmap_files = sorted(
+                data_dir.glob("heatmap_payload_xgb_*.json"),
+                reverse=True,
+            )
+            if not heatmap_files:
+                logger.warning("No heatmap payload found in %s", data_dir)
+                return
+
+            with open(heatmap_files[0], "r") as f:
+                self.heatmap_data = json.load(f)
+            self.is_loaded = True
+            logger.info("Flood heatmap loaded from %s", heatmap_files[0].name)
+
+        except Exception:
+            logger.exception("Failed to load flood heatmap")
             self.is_loaded = False
     
     def assess_risk(
@@ -99,7 +102,7 @@ class FloodModel:
         longitude: float,
         rainfall_mm: Optional[float] = None,
         river_discharge: Optional[float] = None,
-        use_geo_blend: bool = True,
+        use_geo_blend: bool = False,
     ) -> FloodRiskLevel:
         """
         Assess flood risk at given location
@@ -153,48 +156,81 @@ class FloodModel:
                 affected_areas=affected
             )
         
-        except Exception as e:
-            print(f"❌ Error assessing flood risk: {e}")
+        except Exception:
+            logger.exception("Error assessing flood risk")
             return FloodRiskLevel(
                 risk_level="UNKNOWN",
                 risk_score=-1,
-                affected_areas=[]
+                affected_areas=[],
             )
     
     def _get_heatmap_risk(self, lat: float, lon: float) -> float:
-        """Get risk score from precomputed heatmap (Pakistan-wide coverage)"""
+        """Get risk score (0–100) from the precomputed XGBoost heatmap.
+
+        The heatmap payload from the training pipeline nests points under
+        `grid.points` with `lng` / `weight` keys (weight is a 0–1 calibrated
+        probability). Older fallback payloads may store `grid` as a flat list
+        with `lon` / `risk_score`. Handle both.
+        """
         try:
-            # Heatmap is grid-based, find closest grid point
-            if "grid" in self.heatmap_data:
-                grid = self.heatmap_data["grid"]
-                # Find nearest grid point
-                min_distance = float('inf')
-                risk_value = 20.0
-                
-                for point in grid:
-                    distance = ((lat - point["lat"]) ** 2 + (lon - point["lon"]) ** 2) ** 0.5
-                    if distance < min_distance:
-                        min_distance = distance
-                        risk_value = point.get("risk_score", 20.0)
-                
-                return risk_value
+            points = self._heatmap_points()
+            if not points:
+                return 20.0
+
+            min_distance_sq = float("inf")
+            risk_value = 20.0
+            for plat, plon, score in points:
+                d_sq = (lat - plat) ** 2 + (lon - plon) ** 2
+                if d_sq < min_distance_sq:
+                    min_distance_sq = d_sq
+                    risk_value = score
+            return risk_value
+        except Exception:
+            logger.exception("Heatmap lookup error")
             return 20.0
-        except Exception as e:
-            print(f"Heatmap lookup error: {e}")
-            return 20.0
+
+    def _heatmap_points(self) -> List[tuple]:
+        """Return cached normalised heatmap points as (lat, lon, score_0_100)."""
+        if getattr(self, "_normalised_points", None) is not None:
+            return self._normalised_points
+
+        raw = self.heatmap_data.get("grid") if self.heatmap_data else None
+        if isinstance(raw, dict):
+            raw_points = raw.get("points", [])
+        elif isinstance(raw, list):
+            raw_points = raw
+        else:
+            raw_points = []
+
+        out = []
+        for p in raw_points:
+            plat = p.get("lat")
+            plon = p.get("lon", p.get("lng"))
+            if plat is None or plon is None:
+                continue
+            # Training pipeline emits 0–1 probabilities under "weight";
+            # fallback payloads use 0–100 under "risk_score".
+            if "risk_score" in p:
+                score = float(p["risk_score"])
+            else:
+                score = float(p.get("weight", 0.0)) * 100.0
+            out.append((float(plat), float(plon), score))
+
+        self._normalised_points = out
+        return out
     
+    # Calibrated against historical 7-day peak rainfall sums (~0–100 mm range).
+    # Do NOT raise without re-running the historical backtest in
+    # /flood/historical/model — that pipeline depends on this scale.
+    _RAINFALL_SATURATION_MM = 100.0
+    _DISCHARGE_SATURATION = 5000.0
+
     def _compute_risk_from_features(self, rainfall: float, discharge: float) -> float:
-        """Compute risk from rainfall and discharge features"""
-        # Simple heuristic: higher rainfall and discharge = higher risk
-        # Adjust thresholds based on Pakistan climate
-        
-        rainfall_risk = min(100, (rainfall / 100) * 100)  # 100mm = 100% from rainfall
-        discharge_risk = min(100, (discharge / 5000) * 100)  # 5000 units = 100% from discharge
-        
-        # Combined risk (weighted average)
-        combined_risk = (rainfall_risk * 0.6) + (discharge_risk * 0.4)
-        
-        return min(100, max(0, combined_risk))
+        """Compute risk (0–100) from recent rainfall and river discharge."""
+        rainfall_risk = min(100.0, (rainfall / self._RAINFALL_SATURATION_MM) * 100.0)
+        discharge_risk = min(100.0, (discharge / self._DISCHARGE_SATURATION) * 100.0)
+        combined = rainfall_risk * 0.6 + discharge_risk * 0.4
+        return min(100.0, max(0.0, combined))
     
     def _get_affected_areas(self, lat: float, lon: float) -> List[str]:
         """Return nearest city + district/province for the given coordinates."""
@@ -246,24 +282,42 @@ class FloodModel:
             ("Hunza",         "Gilgit-Baltistan",36.32, 74.65),
         ]
 
+        # Approximate-distance ranking with cosine correction so longitudes near
+        # 30°N don't over-count vs. latitudes.
+        cos_lat = math.cos(math.radians(lat))
         candidates = []
         for city, province, city_lat, city_lon in _CITIES:
-            km = math.sqrt((lat - city_lat) ** 2 + (lon - city_lon) ** 2) * 111
+            dlat = lat - city_lat
+            dlon = (lon - city_lon) * cos_lat
+            km = math.sqrt(dlat * dlat + dlon * dlon) * 111
             candidates.append((km, city, province))
 
         candidates.sort()
 
-        results = []
+        results: List[str] = []
         nearest_km, nearest_city, nearest_province = candidates[0]
+        # Most major Pakistani cities are also district headquarters and share
+        # the district name (Karachi, Lahore, Sukkur, Quetta, …). Surface that
+        # explicitly so the UI shows "Karachi District, Sindh" rather than
+        # an ambiguous "Karachi, Sindh".
         if nearest_km < 20:
-            results.append(f"{nearest_city}, {nearest_province}")
+            results.append(f"{nearest_city} District, {nearest_province}")
+        elif nearest_km < 60:
+            results.append(
+                f"{nearest_city} District, {nearest_province} "
+                f"(~{int(nearest_km)} km)"
+            )
         else:
-            results.append(f"~{int(nearest_km)} km from {nearest_city}, {nearest_province}")
+            results.append(
+                f"{nearest_province} — near {nearest_city} District "
+                f"(~{int(nearest_km)} km)"
+            )
 
-        # Add a second nearby city if within 60 km and different province
-        for km, city, province in candidates[1:4]:
-            if km < 60 and province != nearest_province:
-                results.append(f"{city}, {province}")
+        # Add a second nearby district within 80 km from a different province
+        # so cross-border risk gets surfaced (e.g. Sindh / Balochistan flooding).
+        for km, city, province in candidates[1:5]:
+            if km < 80 and province != nearest_province:
+                results.append(f"{city} District, {province}")
                 break
 
         return results
@@ -283,21 +337,33 @@ class FloodModel:
         LON_MIN, LON_MAX = 61.0, 77.5
         GRID_STEP = 0.5  # 0.5 degree resolution
         
-        # If we have precomputed heatmap, use it
-        if self.heatmap_data and "grid" in self.heatmap_data:
-            return {
-                "timestamp": datetime.now().isoformat(),
-                "regions": self.heatmap_data.get("regions", {}),
-                "grid": self.heatmap_data["grid"],
-                "bounds": {
-                    "north": LAT_MAX,
-                    "south": LAT_MIN,
-                    "east": LON_MAX,
-                    "west": LON_MIN
-                },
-                "resolution_degrees": GRID_STEP,
-                "data_source": "xgboost_model"
-            }
+        # If we have precomputed heatmap, normalise it to the flat list schema
+        # the Flutter app expects (lat / lon / risk_score / risk_level).
+        if self.heatmap_data:
+            points = self._heatmap_points()
+            if points:
+                grid_out = [
+                    {
+                        "lat": round(plat, 3),
+                        "lon": round(plon, 3),
+                        "risk_score": round(score, 2),
+                        "risk_level": self._get_risk_level(score),
+                    }
+                    for plat, plon, score in points
+                ]
+                return {
+                    "timestamp": datetime.now().isoformat(),
+                    "grid": grid_out,
+                    "bounds": {
+                        "north": LAT_MAX,
+                        "south": LAT_MIN,
+                        "east": LON_MAX,
+                        "west": LON_MIN,
+                    },
+                    "resolution_degrees": GRID_STEP,
+                    "total_points": len(grid_out),
+                    "data_source": "xgboost_model",
+                }
         
         # Fallback: Generate grid from model predictions
         lat = LAT_MIN

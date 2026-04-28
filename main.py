@@ -43,6 +43,7 @@ usgs_fetcher = USGSFetcher()
 rainfall_fetcher = RainfallFetcher()
 data_cache = DataCache(ttl_seconds=300)
 historical_cache = DataCache(ttl_seconds=86400)  # historical model results cached for 24 h
+live_heatmap_cache = DataCache(ttl_seconds=3600)  # live heatmap cached 1 h
 
 # Peak flood periods for each supported year
 _FLOOD_YEAR_PERIODS: dict[int, tuple[str, str]] = {
@@ -373,8 +374,8 @@ async def get_flood_forecast(
         alias="date",
         description="Date to forecast (YYYY-MM-DD). Past dates use archive data; future dates use forecast."
     ),
-    latitude:  float = Query(30.3753, ge=23.0, le=38.0, description="Latitude (Pakistan: 23–38)"),
-    longitude: float = Query(69.3451, ge=60.0, le=78.5, description="Longitude (Pakistan: 60–78.5)"),
+    latitude:  float = Query(30.3753, ge=PK_LAT_MIN, le=PK_LAT_MAX, description="Latitude (Pakistan: 23.5–37.5)"),
+    longitude: float = Query(69.3451, ge=PK_LNG_MIN, le=PK_LNG_MAX, description="Longitude (Pakistan: 60.0–78.5)"),
 ):
     """
     Get flood risk for any specific date — historical archive or 7-day forecast.
@@ -386,40 +387,30 @@ async def get_flood_forecast(
 
         rainfall_mm = 0.0
 
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            if target <= today:
-                # Historical: use archive API, 3-day window around target date
-                window_start = target - timedelta(days=2)
-                params = {
-                    "latitude":   latitude,
-                    "longitude":  longitude,
-                    "start_date": window_start.isoformat(),
-                    "end_date":   target.isoformat(),
-                    "daily":      "precipitation_sum",
-                    "timezone":   "Asia/Karachi",
-                }
-                resp = await client.get(
-                    "https://archive-api.open-meteo.com/v1/archive",
-                    params=params
-                )
-            else:
-                # Forecast: use open-meteo forecast API
-                # Clamp to max 7 days ahead
-                delta = (target - today).days
-                if delta > 16:
-                    raise HTTPException(400, "Can forecast at most 16 days into the future.")
-                params = {
-                    "latitude":     latitude,
-                    "longitude":    longitude,
-                    "daily":        "precipitation_sum",
-                    "timezone":     "Asia/Karachi",
-                    "forecast_days": delta + 1,
-                }
-                resp = await client.get(
-                    "https://api.open-meteo.com/v1/forecast",
-                    params=params
-                )
+        # Use the same 3-day window (target − 2 … target) for both historical and
+        # forecast paths so risk scores are comparable across dates. The forecast
+        # branch previously summed every day from today→target, which inflated risk
+        # for far-future dates regardless of conditions on that day.
+        if (target - today).days > 16:
+            raise HTTPException(400, "Can forecast at most 16 days into the future.")
 
+        window_start = target - timedelta(days=2)
+        params = {
+            "latitude":   latitude,
+            "longitude":  longitude,
+            "start_date": window_start.isoformat(),
+            "end_date":   target.isoformat(),
+            "daily":      "precipitation_sum",
+            "timezone":   "Asia/Karachi",
+        }
+        url = (
+            "https://archive-api.open-meteo.com/v1/archive"
+            if target <= today
+            else "https://api.open-meteo.com/v1/forecast"
+        )
+
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(url, params=params)
             data = resp.json()
 
         if "daily" in data and "precipitation_sum" in data["daily"]:
@@ -451,11 +442,72 @@ async def get_flood_forecast(
 
 @app.get("/flood/heatmap")
 async def get_flood_heatmap():
-    """Pakistan-wide flood risk heatmap grid (for map visualisation)."""
+    """Pakistan-wide flood risk heatmap from live Open-Meteo conditions.
+
+    Computes risk on a 1° grid using actual rainfall from the past 7 days, then
+    upsamples to 0.5° for smooth Flutter rendering. Cached 1 h. Replaces the
+    earlier behaviour of returning a precomputed model snapshot, which was a
+    stale date-specific forecast and lit up regions (e.g. Balochistan in
+    flash-flood season) regardless of current conditions.
+    """
+    cache_key = "live_heatmap"
+    cached = live_heatmap_cache.get(cache_key)
+    if cached:
+        return cached
+
     try:
-        return flood_model.get_pakistan_heatmap()
+        today = datetime.utcnow().date()
+        start = (today - timedelta(days=6)).isoformat()
+        end = today.isoformat()
+
+        grid = _pakistan_grid()
+
+        import asyncio
+        # Matches /flood/historical/model — keeps Open-Meteo 429s out of the
+        # response. With ~238 grid points this finishes in ~16 s on first hit.
+        semaphore = asyncio.Semaphore(10)
+
+        async def assess_point(lat: float, lon: float) -> dict:
+            async with semaphore:
+                weather = await rainfall_fetcher.get_historical_rainfall(
+                    lat, lon, start, end
+                )
+                risk = flood_model.assess_risk(
+                    lat,
+                    lon,
+                    weather["rainfall_mm"],
+                    weather["river_discharge"],
+                    use_geo_blend=False,
+                )
+                return {
+                    "lat": lat,
+                    "lon": lon,
+                    "risk_score": round(risk.risk_score, 2),
+                    "risk_level": risk.risk_level,
+                    "rainfall_mm": round(weather["rainfall_mm"], 1),
+                }
+
+        coarse = await asyncio.gather(*[assess_point(lat, lon) for lat, lon in grid])
+        upsampled = _upsample_grid(list(coarse))
+
+        response = {
+            "timestamp": datetime.now().isoformat(),
+            "period": f"{start} to {end}",
+            "grid": upsampled,
+            "bounds": {
+                "north": PK_LAT_MAX,
+                "south": PK_LAT_MIN,
+                "east": PK_LNG_MAX,
+                "west": PK_LNG_MIN,
+            },
+            "total_points": len(upsampled),
+            "data_source": "open_meteo_archive_7d",
+        }
+        live_heatmap_cache.set(cache_key, response)
+        return response
+
     except Exception as e:
-        logger.error(f"Error fetching flood heatmap: {e}")
+        logger.exception("Error computing live flood heatmap")
         raise HTTPException(status_code=500, detail=str(e))
 
 
